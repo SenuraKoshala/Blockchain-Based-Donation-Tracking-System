@@ -5,8 +5,18 @@ pragma solidity ^0.8.20;
  * @title Blockchain-Based Donation Tracking & Milestone Escrow System
  * @notice Transparent charity platform where funds are locked in escrow
  *         and released only when verified milestones are completed.
- *         Donors can reclaim their pro-rata share of undisbursed funds
- *         if a campaign is cancelled.
+ *
+ * @dev Hardening applied in this revision:
+ *      1. Funding-availability check at approval time (no more "approved but
+ *         unfunded" limbo) via a reservedForApproval accounting field.
+ *      2. Cancellation is blocked while any milestone is Approved-but-not-yet-
+ *         Disbursed, closing the verifier front-run/griefing window.
+ *      3. Push payments fall back to a pull-payment credit (pendingWithdrawals)
+ *         instead of reverting, so a picky recipient contract can't brick a
+ *         milestone permanently.
+ *      4. Milestones must be completed (Disbursed) strictly in order.
+ *      5. A minimum donation amount blocks dust-donation array-bloat spam, and
+ *         paginated getters avoid ever having to return an unbounded array.
  */
 contract DonationTracking {
 
@@ -44,6 +54,7 @@ contract DonationTracking {
         uint256 escrowBalance;         // Current locked balance in contract
         uint256 totalDisbursed;        // Total funds already released to NGO
         uint256 milestoneCount;
+        uint256 reservedForApproval;   // Sum of targetAmounts for Approved-but-undisbursed milestones
         bool isCompleted;
         bool isCancelled;              // True once cancelled; enables refunds
         uint256 escrowAtCancellation;  // Snapshot of escrowBalance when cancelled
@@ -60,6 +71,13 @@ contract DonationTracking {
     mapping(uint256 => mapping(address => uint256)) public donorContributions;
     mapping(uint256 => mapping(address => bool)) public refundClaimed;
 
+    // Pull-payment fallback: credited when a direct push transfer fails
+    mapping(address => uint256) public pendingWithdrawals;
+
+    // Minimum donation amount, to make array-bloat spam (thousands of dust
+    // donations) economically pointless.
+    uint256 public constant MIN_DONATION = 0.0001 ether;
+
     // --- EVENTS (for real-time frontend notifications) ---
 
     event CampaignCreated(uint256 indexed campaignId, string title, address indexed owner, address indexed verifier, uint256 goal);
@@ -68,8 +86,11 @@ contract DonationTracking {
     event MilestoneApproved(uint256 indexed campaignId, uint256 indexed milestoneId, address indexed verifier);
     event MilestoneRejected(uint256 indexed campaignId, uint256 indexed milestoneId, address indexed verifier);
     event FundsReleased(uint256 indexed campaignId, uint256 indexed milestoneId, uint256 amount, address recipient);
+    event FundsQueuedForPickup(uint256 indexed campaignId, uint256 indexed milestoneId, address indexed recipient, uint256 amount);
     event CampaignCancelled(uint256 indexed campaignId, uint256 escrowAtCancellation);
     event RefundClaimed(uint256 indexed campaignId, address indexed donor, uint256 amount);
+    event RefundQueuedForPickup(uint256 indexed campaignId, address indexed donor, uint256 amount);
+    event PendingWithdrawalClaimed(address indexed recipient, uint256 amount);
 
     // --- MODIFIERS (Access Control) ---
 
@@ -146,6 +167,7 @@ contract DonationTracking {
             escrowBalance: 0,
             totalDisbursed: 0,
             milestoneCount: _milestoneDescriptions.length,
+            reservedForApproval: 0,
             isCompleted: false,
             isCancelled: false,
             escrowAtCancellation: 0
@@ -157,10 +179,12 @@ contract DonationTracking {
 
     /**
      * @notice Donors call this function and send ETH. Funds remain locked in contract escrow.
-     *         Donations are capped so a campaign cannot be overfunded past its goal.
+     *         Donations are capped so a campaign cannot be overfunded past its goal, and a
+     *         minimum amount is enforced so the donation-history array cannot be cheaply
+     *         bloated with thousands of dust entries.
      */
     function donate(uint256 _campaignId) external payable campaignExists(_campaignId) {
-        require(msg.value > 0, "Donation amount must be greater than 0");
+        require(msg.value >= MIN_DONATION, "Donation below minimum threshold");
         Campaign storage c = campaigns[_campaignId];
         require(!c.isCompleted, "Campaign is already completed");
         require(!c.isCancelled, "Campaign is cancelled");
@@ -181,6 +205,8 @@ contract DonationTracking {
 
     /**
      * @notice NGO submits proof of completion (e.g., photo/receipt IPFS hash).
+     *         Milestones must be submitted in order: milestone N cannot be
+     *         submitted until milestone N-1 has been fully Disbursed.
      */
     function submitMilestoneProof(
         uint256 _campaignId,
@@ -193,6 +219,10 @@ contract DonationTracking {
         Milestone storage m = campaignMilestones[_campaignId][_milestoneId];
         require(m.status == MilestoneStatus.Pending, "Milestone is not in Pending state");
         require(bytes(_proofHash).length > 0, "Proof hash cannot be empty");
+        require(
+            _milestoneId == 1 || campaignMilestones[_campaignId][_milestoneId - 1].status == MilestoneStatus.Disbursed,
+            "Previous milestone must be completed first"
+        );
 
         m.proofHash = _proofHash;
         m.status = MilestoneStatus.Submitted;
@@ -201,16 +231,25 @@ contract DonationTracking {
     }
 
     /**
-     * @notice Designated verifier reviews the proof and approves it.
+     * @notice Designated verifier reviews the proof and approves it. Approval is only
+     *         allowed if enough *unreserved* escrow already exists to cover this
+     *         milestone, so an approved milestone can never get stuck unable to be
+     *         paid out (fixes the underfunded-execution-limbo issue).
      */
     function approveMilestone(
         uint256 _campaignId,
         uint256 _milestoneId
     ) external campaignExists(_campaignId) onlyVerifier(_campaignId) milestoneExists(_campaignId, _milestoneId) {
+        Campaign storage c = campaigns[_campaignId];
         Milestone storage m = campaignMilestones[_campaignId][_milestoneId];
         require(m.status == MilestoneStatus.Submitted, "Milestone proof not submitted yet");
+        require(
+            c.escrowBalance - c.reservedForApproval >= m.targetAmount,
+            "Insufficient unreserved escrow to approve this milestone yet"
+        );
 
         m.status = MilestoneStatus.Approved;
+        c.reservedForApproval += m.targetAmount;
 
         emit MilestoneApproved(_campaignId, _milestoneId, msg.sender);
     }
@@ -233,9 +272,12 @@ contract DonationTracking {
     }
 
     /**
-     * @notice Releases escrowed funds for an approved milestone directly to the NGO.
-     *         Restricted to the campaign owner or verifier so third parties cannot
-     *         trigger fund movement on the NGO's behalf.
+     * @notice Releases escrowed funds for an approved milestone to the NGO.
+     *         Restricted to the campaign owner or verifier. If the direct push
+     *         transfer fails (e.g. recipient is a multisig that rejects/out-of-gas
+     *         on receive), the amount is credited to pendingWithdrawals instead of
+     *         reverting, so the milestone still settles and the NGO can pull the
+     *         funds later via withdrawPending().
      */
     function releaseFunds(
         uint256 _campaignId,
@@ -248,9 +290,12 @@ contract DonationTracking {
         require(m.status == MilestoneStatus.Approved, "Milestone must be approved before releasing funds");
         require(c.escrowBalance >= m.targetAmount, "Insufficient escrow balance from donations");
 
+        uint256 amount = m.targetAmount;
+
         m.status = MilestoneStatus.Disbursed;
-        c.escrowBalance -= m.targetAmount;
-        c.totalDisbursed += m.targetAmount;
+        c.escrowBalance -= amount;
+        c.totalDisbursed += amount;
+        c.reservedForApproval -= amount;
 
         // Check if all milestones are disbursed
         bool allDisbursed = true;
@@ -264,17 +309,25 @@ contract DonationTracking {
             c.isCompleted = true;
         }
 
-        // Transfer funds from contract to NGO owner address
-        (bool sent, ) = c.campaignOwner.call{value: m.targetAmount}("");
-        require(sent, "Failed to transfer escrow funds to campaign owner");
-
-        emit FundsReleased(_campaignId, _milestoneId, m.targetAmount, c.campaignOwner);
+        // Attempt direct transfer; fall back to pull-payment credit on failure
+        // instead of reverting, so a picky recipient contract can't brick the
+        // milestone permanently.
+        (bool sent, ) = c.campaignOwner.call{value: amount}("");
+        if (sent) {
+            emit FundsReleased(_campaignId, _milestoneId, amount, c.campaignOwner);
+        } else {
+            pendingWithdrawals[c.campaignOwner] += amount;
+            emit FundsQueuedForPickup(_campaignId, _milestoneId, c.campaignOwner, amount);
+        }
     }
 
     /**
      * @notice Cancels a campaign, freezing further donations, submissions and
      *         releases, and enabling donors to claim pro-rata refunds of the
-     *         remaining escrow. Callable by the NGO or the verifier.
+     *         remaining escrow. Callable by the NGO or the verifier, but blocked
+     *         while any milestone is Approved-and-awaiting-disbursement, so a
+     *         verifier cannot front-run a pending payout to grief the NGO out of
+     *         funds for already-approved work.
      */
     function cancelCampaign(uint256 _campaignId)
         external
@@ -284,6 +337,13 @@ contract DonationTracking {
         Campaign storage c = campaigns[_campaignId];
         require(!c.isCompleted, "Campaign already completed");
         require(!c.isCancelled, "Campaign already cancelled");
+
+        for (uint256 i = 1; i <= c.milestoneCount; i++) {
+            require(
+                campaignMilestones[_campaignId][i].status != MilestoneStatus.Approved,
+                "Cannot cancel while a milestone is approved and pending release"
+            );
+        }
 
         c.isCancelled = true;
         c.escrowAtCancellation = c.escrowBalance;
@@ -295,6 +355,7 @@ contract DonationTracking {
      * @notice Lets a donor claim their pro-rata share of the escrow balance
      *         that remained at the moment a campaign was cancelled.
      *         share = donorContribution * escrowAtCancellation / totalDonated
+     *         Falls back to a pull-payment credit if the direct transfer fails.
      */
     function claimRefund(uint256 _campaignId) external campaignExists(_campaignId) {
         Campaign storage c = campaigns[_campaignId];
@@ -311,15 +372,68 @@ contract DonationTracking {
         c.escrowBalance -= refundAmount;
 
         (bool sent, ) = payable(msg.sender).call{value: refundAmount}("");
-        require(sent, "Refund transfer failed");
+        if (sent) {
+            emit RefundClaimed(_campaignId, msg.sender, refundAmount);
+        } else {
+            pendingWithdrawals[msg.sender] += refundAmount;
+            emit RefundQueuedForPickup(_campaignId, msg.sender, refundAmount);
+        }
+    }
 
-        emit RefundClaimed(_campaignId, msg.sender, refundAmount);
+    /**
+     * @notice Pull-payment escape hatch. Anyone with a credited balance (from a
+     *         releaseFunds or claimRefund push that failed) can retrieve it here.
+     */
+    function withdrawPending() external {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        require(amount > 0, "No pending withdrawal");
+
+        pendingWithdrawals[msg.sender] = 0;
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "Withdrawal failed");
+
+        emit PendingWithdrawalClaimed(msg.sender, amount);
     }
 
     // --- VIEW / AUDIT FUNCTIONS ---
 
+    /**
+     * @notice Returns the full donation history for a campaign.
+     * @dev Bounded in practice by MIN_DONATION raising the cost of array-bloat
+     *      spam, but for campaigns with very long histories prefer
+     *      getDonationsPaginated to avoid large single-call payloads.
+     */
     function getDonations(uint256 _campaignId) external view campaignExists(_campaignId) returns (DonationRecord[] memory) {
         return campaignDonations[_campaignId];
+    }
+
+    /// @notice Number of donation records for a campaign (for pagination).
+    function getDonationsCount(uint256 _campaignId) external view campaignExists(_campaignId) returns (uint256) {
+        return campaignDonations[_campaignId].length;
+    }
+
+    /// @notice Returns a bounded slice of a campaign's donation history.
+    function getDonationsPaginated(
+        uint256 _campaignId,
+        uint256 _offset,
+        uint256 _limit
+    ) external view campaignExists(_campaignId) returns (DonationRecord[] memory) {
+        DonationRecord[] storage all = campaignDonations[_campaignId];
+        if (_offset >= all.length) {
+            return new DonationRecord[](0);
+        }
+
+        uint256 end = _offset + _limit;
+        if (end > all.length) {
+            end = all.length;
+        }
+
+        DonationRecord[] memory page = new DonationRecord[](end - _offset);
+        for (uint256 i = _offset; i < end; i++) {
+            page[i - _offset] = all[i];
+        }
+        return page;
     }
 
     function getMilestone(uint256 _campaignId, uint256 _milestoneId)
