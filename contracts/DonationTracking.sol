@@ -184,11 +184,22 @@ contract DonationTracking {
      *         bloated with thousands of dust entries.
      */
     function donate(uint256 _campaignId) external payable campaignExists(_campaignId) {
-        require(msg.value >= MIN_DONATION, "Donation below minimum threshold");
+        require(msg.value > 0, "Donation amount must be greater than 0");
         Campaign storage c = campaigns[_campaignId];
         require(!c.isCompleted, "Campaign is already completed");
         require(!c.isCancelled, "Campaign is cancelled");
-        require(c.totalDonated + msg.value <= c.fundingGoal, "Donation exceeds remaining funding goal");
+
+        uint256 remaining = c.fundingGoal - c.totalDonated;
+        require(msg.value <= remaining, "Donation exceeds remaining funding goal");
+        // Normally a donation must clear MIN_DONATION (blocks dust-spam of the
+        // donations array). The one exception is a donation that exactly closes
+        // out the campaign: without this, a remaining gap smaller than
+        // MIN_DONATION would be impossible to fill from either side and the
+        // campaign would be permanently stuck short of its goal. Because it must
+        // equal the *exact* remaining amount, this can only ever fire once per
+        // campaign (afterwards `remaining` is 0 and no further donation of any
+        // size is accepted), so it re-opens no spam vector.
+        require(msg.value >= MIN_DONATION || msg.value == remaining, "Donation below minimum threshold");
 
         c.totalDonated += msg.value;
         c.escrowBalance += msg.value;
@@ -242,6 +253,7 @@ contract DonationTracking {
     ) external campaignExists(_campaignId) onlyVerifier(_campaignId) milestoneExists(_campaignId, _milestoneId) {
         Campaign storage c = campaigns[_campaignId];
         Milestone storage m = campaignMilestones[_campaignId][_milestoneId];
+        require(!c.isCancelled, "Campaign is cancelled");
         require(m.status == MilestoneStatus.Submitted, "Milestone proof not submitted yet");
         require(
             c.escrowBalance - c.reservedForApproval >= m.targetAmount,
@@ -262,7 +274,9 @@ contract DonationTracking {
         uint256 _campaignId,
         uint256 _milestoneId
     ) external campaignExists(_campaignId) onlyVerifier(_campaignId) milestoneExists(_campaignId, _milestoneId) {
+        Campaign storage c = campaigns[_campaignId];
         Milestone storage m = campaignMilestones[_campaignId][_milestoneId];
+        require(!c.isCancelled, "Campaign is cancelled");
         require(m.status == MilestoneStatus.Submitted, "Milestone proof not submitted yet");
 
         m.status = MilestoneStatus.Pending;
